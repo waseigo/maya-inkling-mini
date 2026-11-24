@@ -464,6 +464,17 @@ void f16_limbs_rows(const float* x, int T, int C, uint16_t* out, cudaStream_t s)
 void group_route(const int* top, const float* w, int S, int K, const uint8_t* const* tab, const float* sg_t,
                  const float* su_t, const float* sd_t, const uint8_t** blob, int* n, int* tok, int* row, float* sg,
                  float* su, float* wt, int* inv, cudaStream_t s);
+/// A window's picks as one GPU owns them (EP): top / w [S] stay in the window's slots - the slots whose expert owner
+/// (device [E], 0 / 1) is not gpu become -1, which group_route makes no group of - and n_out[0] counts the GPU's own.
+/// (The slots are not packed: group_route reads a member's token and row from its slot, so packing would need a slot
+/// table.)  top and w stay on the device: no pick crosses the host.
+void ep_compact(const int* top, const float* w, const uint8_t* owner, int S, int gpu, int* top_out, float* w_out,
+                int* n_out, cudaStream_t s);
+/// The combine's table of a window on a GPU that ran ep_compact: slot i's row of y - its owner's block (S rows each)
+/// at the slot itself - and its weight (the route's, times down's scale sd [E], or 1 when sd is null):
+/// moe_combine_f32's inv / wt.
+void ep_slots(const int* top, const float* w, const uint8_t* owner, const float* sd, int S, int* id, float* wt,
+              cudaStream_t s);
 /// group_route's groups of NVFP4 experts on the tensor cores: gate | up (the input as f16_limbs_rows' limbs) to
 /// h [slot][F] through the capped SwiGLU; down from h to y [slot][C].  G: the launch's groups (those past the last
 /// return at once); T: the window's tokens (a group's members).

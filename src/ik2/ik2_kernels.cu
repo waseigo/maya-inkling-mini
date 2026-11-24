@@ -5131,6 +5131,7 @@ __global__ void group_route_kernel(const int* __restrict__ top, const float* __r
     }
     __syncthreads();
     if (i >= S) return;
+    if (e < 0) return;   // (a slot whose expert is not this caller's - ep_compact's -1: no group, n[g] stays 0)
     const int g = gid[first];
     tok[g * kGroupMax + m] = i / K, row[g * kGroupMax + m] = i;
     if (first == i) blob[g] = tab[e], n[g] = cnt;
@@ -6534,6 +6535,46 @@ void group_route(const int* top, const float* w, int S, int K, const uint8_t* co
     }
     group_route_kernel<<<1, 64, 0, s>>>(top, w, S, K, tab, sg_t, su_t, sd_t, blob, n, tok, row, sg, su, wt, inv);
     check("group_route");
+}
+// a GPU's share of a window's picks (EP), in the window's own slots: its own experts stay, the other GPU's become -1
+// (no group): a member's token and row stay its slot's, which group_route reads them from
+__global__ void ep_compact_kernel(const int* __restrict__ top, const float* __restrict__ w,
+                                  const uint8_t* __restrict__ owner, int S, int gpu, int* __restrict__ top_out,
+                                  float* __restrict__ w_out, int* __restrict__ n_out) {
+    const int i = threadIdx.x;
+    if (i >= S) return;
+    if (owner[top[i]] == gpu) top_out[i] = top[i], w_out[i] = w[i];
+    else top_out[i] = -1, w_out[i] = 0.0f;
+    if (i == 0) {
+        int n = 0;
+        for (int j = 0; j < S; ++j) n += owner[top[j]] == gpu;
+        n_out[0] = n;
+    }
+}
+void ep_compact(const int* top, const float* w, const uint8_t* owner, int S, int gpu, int* top_out, float* w_out,
+                int* n_out, cudaStream_t s) {
+    if (S <= 0 || S > 64) {
+        std::fprintf(stderr, "ik2::k::ep_compact: %d slots (1 .. 64)\n", S);
+        std::abort();
+    }
+    ep_compact_kernel<<<1, 64, 0, s>>>(top, w, owner, S, gpu, top_out, w_out, n_out);
+    check("ep_compact");
+}
+// the combine's table of a window (EP; the picks never leave the device)
+__global__ void ep_slots_kernel(const int* __restrict__ top, const float* __restrict__ w,
+                                const uint8_t* __restrict__ owner, const float* sd, int S, int* __restrict__ id,
+                                float* __restrict__ wt) {
+    const int i = threadIdx.x;
+    if (i >= S) return;
+    const int e = top[i];
+    id[i] = owner[e] * S + i;   // (the owner's block of y, at the slot itself)
+    wt[i] = w[i] * (sd ? sd[e] : 1.0f);
+}
+void ep_slots(const int* top, const float* w, const uint8_t* owner, const float* sd, int S, int* id, float* wt,
+              cudaStream_t s) {
+    if (S <= 0) return;
+    ep_slots_kernel<<<1, 64, 0, s>>>(top, w, owner, sd, S, id, wt);
+    check("ep_slots");
 }
 void experts_block_gu(const uint8_t* const* blob, const int* n, const int* tok, const int* row, int G, int T,
                       size_t off_up, int C, int F, const uint16_t* limbs, const float* sg, const float* su, float gcap,

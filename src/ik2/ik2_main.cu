@@ -259,6 +259,12 @@ struct Layer {
     const uint8_t** tab_blob = nullptr;
     float* tab_sc[3] = {};
     std::vector<const uint8_t*> tab_h;             // (tab_blob on the host: a short prompt's groups)
+    // expert parallel, every owned expert resident (IK2_EP, forward's ep_dev): each GPU's copy of the layer's blob
+    // pointers [E] - an expert's slot in that GPU's cache, null when the other GPU owns it - its owner table [E] and
+    // the experts' scales, so the layer's route, its grouping, its experts and the combine run on the devices
+    const uint8_t** tab_ep[2] = {};
+    uint8_t* ep_own[2] = {};
+    float* sc_ep[2][3] = {};
     // the state: of the visit being run (bind_visit)
     uint16_t *kc = nullptr, *vc = nullptr;         // FP16 [kv_cap][KV * D] (IK2_KV=f16)
     uint8_t *kc8 = nullptr, *vc8 = nullptr;        // FP8 E4M3 [kv_cap][KV * D] (IK2_KV=fp8)
@@ -374,7 +380,10 @@ int g_pop_E_ep = 0;
 // expert e of every layer belongs to GPU e & 1, each GPU with its own cache over all layers and its own PCIe link.
 // In decode a layer's picks go to their GPUs at once, both links copying the misses side by side.
 bool g_ep = false;
+bool g_ep_tab = false;                // the device route is on: every layer's owned experts resident on both GPUs
+uint64_t g_ep_tab_miss[2] = {0, 0};   // the caches' miss counts when their tables were built (a fetch past them: stale)
 cudaEvent_t g_ep_x, g_ep_cp[2], g_ep_done;
+cudaEvent_t g_ep_xq;                  // (the device route: a layer's input staged at its norm, before its route)
 // IK2_TP=1 with --gpus 2: the experts tensor-parallel instead. GPU d holds half of every expert: rows [d F/2, ..) of
 // gate and up and rows [d C/2, ..) of down, so every miss is half on each link. A layer: each GPU its half of h
 // (gate/up/SwiGLU), the halves swapped (P2P), each GPU its half of the output rows (down), concatenated on GPU 0.
@@ -389,6 +398,8 @@ inline bool dual() { return g_ep || g_tp; }
 std::vector<uint8_t> g_ep_own;
 inline int ep_owner(int l, int e) { return g_ep_own[(size_t) l * g_pop_E_ep + e]; }
 bool g_flash = true;   // IK2_FLASH=0: the prefill's attention (FP16 KV) through the logits in memory and cuBLAS, not fused
+int g_attn_mma = 1;     // tensor-core attn in run_layer_attn and fast_token (IK2_ATTN_MMA=0: scalar; 2: global layers only)
+int g_mma_split = 1;    // attn_decode_mma blocks a K/V head
 int g_n_sm = 0;
 bool g_group = true;   // IK2_GROUP=0: 2 .. 8 tokens' experts a slot at a time, their attention a head at a time
 bool g_group_exp = true, g_group_attn = true;   // (IK2_GROUP=1: the experts grouped only, 2: the attention only)
@@ -1693,7 +1704,35 @@ void run_layer_attn(const Model& M, Layer& Ly, int l, int T, int pos0, const flo
     const float one = 1.0f, zero = 0.0f;
     const float qk_scale = 1.0f / std::sqrt((float) c.D);
     const int attn_kv_cap = Ly.sliding ? Ly.kv_cap : 0;
-    if (T == 1) {
+    const bool mma = (g_attn_mma == 1 || (g_attn_mma == 2 && !Ly.sliding)) && c.D == 128 && c.KV > 0 &&
+                     (c.H / c.KV) <= 8 && (c.H % c.KV) == 0;
+    const int ring = Ly.sliding ? Ly.kv_cap : 0;
+    const int ns = Ly.sliding ? std::min(g_mma_split, std::max(1, (c.window + 63) / 64)) : g_mma_split;
+    const bool mma1 = mma && T == 1 && W.lg_cap >= k::attn_decode_mma_scratch(c.H, ns);
+    const bool block_ok = mma && T >= 2 && T <= 8 && (T * c.H / c.KV) <= 24 &&
+                          W.lg_cap >= k::attn_block_scratch(c.H, T, ns);
+    if (mma1) {
+        k::to_f16(q_p, HD, W.x16, g_s);
+        if (g_kv_fp8)
+            k::attn_decode_mma_fp8(W.x16, r_p, sink_p, Ly.kc8, Ly.vc8, ring, c.H, c.KV, Ly.sliding ? nullptr : pos_p,
+                                   pos0, ns, qk_scale * k_inv, v_inv, Ly.rel_proj, c.d_rel, extent, window, W.lg, W.o,
+                                   nullptr, nullptr, g_s, Ly.page_table);
+        else
+            k::attn_decode_mma_f16(W.x16, r_p, sink_p, Ly.kc, Ly.vc, ring, c.H, c.KV, Ly.sliding ? nullptr : pos_p,
+                                   pos0, ns, qk_scale, Ly.rel_proj, c.d_rel, extent, window, W.lg, W.o, nullptr, nullptr,
+                                   g_s, Ly.page_table);
+    } else if (block_ok) {
+        k::to_f16(q_p, (size_t) T * HD, W.x16, g_s);
+        const int r_ld = HR, gate_ld = HD;
+        if (g_kv_fp8)
+            k::attn_block_fp8(W.x16, r_p, r_ld, sink_p, Ly.kc8, Ly.vc8, ring, c.H, c.KV, pos_p, T, ns,
+                              qk_scale * k_inv, v_inv, Ly.rel_proj, c.d_rel, extent, window, W.lg, W.o, nullptr, gate_ld,
+                              nullptr, g_s, Ly.page_table);
+        else
+            k::attn_block_f16(W.x16, r_p, r_ld, sink_p, Ly.kc, Ly.vc, ring, c.H, c.KV, pos_p, T, ns, qk_scale,
+                              Ly.rel_proj, c.d_rel, extent, window, W.lg, W.o, nullptr, gate_ld, nullptr, g_s,
+                              Ly.page_table);
+    } else if (T == 1) {
         if (g_kv_fp8) {
             k::attn_decode_fp8(q_p, r_p, sink_p, Ly.kc8, Ly.vc8, attn_kv_cap, c.H, c.KV, c.D, k0, nk, pos0,
                                qk_scale * k_inv, v_inv, Ly.rel_proj, c.d_rel, extent, window, W.lg, W.o, g_s,
@@ -1702,7 +1741,7 @@ void run_layer_attn(const Model& M, Layer& Ly, int l, int T, int pos0, const flo
             k::attn_decode_f16(q_p, r_p, sink_p, Ly.kc, Ly.vc, attn_kv_cap, c.H, c.KV, c.D, k0, nk, pos0, qk_scale,
                                Ly.rel_proj, c.d_rel, extent, window, W.lg, W.o, g_s, Ly.page_table);
         }
-    } else if (T <= 8 && g_group && g_group_attn) {
+    } else if (T <= 8 && g_group && g_group_attn && nk < 2048) {
         if (g_kv_fp8) {
             k::attn_multi_fp8(q_p, r_p, sink_p, Ly.kc8, Ly.vc8, attn_kv_cap, T, c.H, c.KV, k0, nk, pos0,
                               qk_scale * k_inv, v_inv, Ly.rel_proj, c.d_rel, extent, window, W.lg, W.o, g_s,
@@ -2236,9 +2275,6 @@ bool g_fast = false;        // set at load: every expert resident, one GPU, the 
 bool g_fast_want = false;
 bool g_graph = true;        // IK2_GRAPH=0: the resident path's launches one by one
 bool g_block = true;        // IK2_BLOCK=0: a verify window through forward() instead of the block path
-int g_attn_mma = 1;         // a token's attention on the tensor cores (IK2_ATTN_MMA=0: the scalar kernels; 2: the
-                            // layers without a window only)
-int g_mma_split = 1;        // its blocks a K / V head (k::attn_decode_mma_blocks: the device filled once)
 struct FastGraph {
     cudaGraph_t graph = nullptr;
     cudaGraphExec_t exec = nullptr;
@@ -2247,6 +2283,43 @@ bool tier_active = false;
 bool stage_cold = false;
 FastGraph g_fgraph[2][4]; // by tier, OutMode (single active slot, evicted on slot switch)
 int g_fgraph_slot = -1;
+
+// Dual-GPU expert parallel (IK2_EP): the target box has no peer access (cudaDeviceCanAccessPeer = 0), so the h a visit
+// sends to GPU 1 and the rows it sends back go through pinned host memory, and a visit's part of a token is three
+// graphs - GPU 1's picks, GPU 0's picks, GPU 0's combine - keyed by T and by the picks each GPU holds, which are their
+// launch shapes (a token whose counts differ recaptures).  A visit's weights and state are what its graphs read, so
+// the visit is part of the key; eight variants a visit and T cover the counts decode revisits.
+struct EpGraphs {
+    static constexpr int kVar = 8, kT = 9;
+    int n0[kVar], n1[kVar], used = 0, next = 0;
+    FastGraph g1[kVar], g0x[kVar], g0c[kVar];
+    EpGraphs() {
+        for (int i = 0; i < kVar; ++i) n0[i] = -1, n1[i] = -1;
+    }
+};
+std::vector<EpGraphs> g_ep_graphs;   // [slot][visit][T]
+uint8_t *g_ep_x_pin = nullptr, *g_ep_y_pin = nullptr;   // [8][C] a visit's h for GPU 1, [64][C] its rows coming back
+uint8_t* g_ep_pk_h[2] = {nullptr, nullptr};   // a GPU's packed tables, pinned: blobs | tok | id | sg | su | wt
+uint8_t* g_ep_pk_d[2] = {nullptr, nullptr};   // ... and on the GPU, where its graphs read them
+float* g_ep_y = nullptr;                      // GPU 0: both GPUs' expert rows, [2][64][C]
+
+// The device-side route of the same path (a layer whose owned experts are all resident): a GPU's window of picks as it
+// owns them - top / w with the other GPU's slots -1, group_route's groups, and on GPU 0 the combine's table.  S = T K
+// <= 64 slots, kGroupMax members a group.
+struct EpDev {
+    int* top = nullptr;              // the window's picks, its own only (then -1)
+    float* w = nullptr;              // their route weights
+    int* n = nullptr;                // how many it owns ([1])
+    const uint8_t** blob = nullptr;  // group_route's: a group's expert
+    int* gn = nullptr;               // ... and its members
+    int* tok = nullptr;              // [64][kGroupMax] the members' tokens
+    int* row = nullptr;              // ... and their slots
+    float *sg = nullptr, *su = nullptr, *wt = nullptr;   // a slot's gate / up / down scales
+    int* inv = nullptr;              // a slot itself
+    int* id = nullptr;               // GPU 0: the combine's - a slot's row of y
+    float* wtc = nullptr;            // ... and its weight
+};
+EpDev g_ep_dev[2];
 
 struct HostExpertPlan {
     ik2::cpu::TransferBuffers buffers;
@@ -3387,6 +3460,38 @@ void spec_step(Model& M, ik2::draft::Drafter* drafter, int anchor, int P, int B,
     ik2::draft::set_f_rnn(drafter, g_taps, g_taps_ld, m - 1);
 }
 
+// Expert parallel, the device route's tables (Layer::tab_ep): a GPU's owned experts' slots as its cache holds them
+// now.  Built at load and again whenever an expert fetch has moved a slot (forward).  False: some layer's owned
+// experts are not all resident, so no layer takes the device route - the host path's Ed.get evicts slots that the
+// other layers' tables point at, so the two never run together.
+bool build_ep_tab(Model& M, int d) {
+    use_dev(d);
+    const Config& c = M.c;
+    ExpertCache& EC = dev_cache(d);
+    bool all = true;
+    for (int l = 0; l < c.n_layer; ++l) {
+        Layer& Ly = M.L[l];
+        const auto& P = EC.pools[EC.layer_pool[l]];
+        std::vector<const uint8_t*> tab(c.E, nullptr);
+        bool ok = true;
+        for (int e = 0; e < c.E; ++e) {
+            if (ep_owner(l, e) != d) continue;
+            if (!EC.has(l, e)) {
+                ok = false;
+                break;
+            }
+            tab[e] = P.data + (size_t) EC.loc[(size_t) l * c.E + e] * P.slot_bytes;
+        }
+        if (!ok) {
+            all = false;
+            continue;
+        }
+        if (!Ly.tab_ep[d]) Ly.tab_ep[d] = dalloc<const uint8_t*>(c.E);
+        CU(cudaMemcpy(Ly.tab_ep[d], tab.data(), (size_t) c.E * sizeof(uint8_t*), cudaMemcpyHostToDevice));
+    }
+    return all;
+}
+
 void forward(Model& M, const int* tok, int T, int pos0, bool all_logits, OutMode out_mode, const std::string& dump,
              std::vector<float>& logits_out, std::vector<int>* argmax_out, double& t_exp, int slot = 0) {
     k::enable_grouped_tensor_products(allow_short_batch_products());
@@ -3395,6 +3500,19 @@ void forward(Model& M, const int* tok, int T, int pos0, bool all_logits, OutMode
     if (g_fast && T == 1 && dump.empty() && !g_prof && !g_rec && !g_trace && g_pop.empty() && g_img.at(pos0) < 0) {
         fast_token(M, tok[0], pos0, out_mode, logits_out, argmax_out, slot);
         return;
+    }
+    if (g_ep_tab && T <= 8 &&
+        (dev_cache(0).misses != g_ep_tab_miss[0] || dev_cache(1).misses != g_ep_tab_miss[1])) {
+        // (an insert moved the cache's slots - a small verify window's, most likely: the tables follow.  A prefill
+        //  evicts the owned set wholesale, so its rebuild finds the first owned expert missing and the route stays off:
+        //  the host path takes decode from there, which is what it did before this path existed.)
+        bool all = true;
+        for (int d = 0; d < 2; ++d) {
+            all = build_ep_tab(M, d) && all;
+            g_ep_tab_miss[d] = dev_cache(d).misses;
+        }
+        g_ep_tab = all;
+        if (!all) note("expert parallel: the owned experts are no longer all in the caches; decode takes the host path");
     }
     if (out_mode == OutMode::kCand) out_mode = OutMode::kLogits, g_cand.n = -1;   // (this path: the logits)
     use_dev(M.L[0].dev);
@@ -3481,6 +3599,13 @@ void forward(Model& M, const int* tok, int T, int pos0, bool all_logits, OutMode
         run_layer_attn(M, Ly, l, T, pos0, W.h, W.pos, nb, 0, W.r, W, msg);
         dump_f("blk." + std::to_string(vis) + ".attn_out", W.r, TC);
         if (l % c.block == 0) ++nb;
+        const int S = T * c.K;
+        // (expert parallel with every owned expert resident (g_ep_tab): the picks stay on the devices - the split by
+        //  owner, the groups, the experts and the combine's table - so nothing a layer routes waits for the host.
+        //  Decided before the MoE's norm: the layer's input is final there, and GPU 1's copy of it is off this
+        //  visit's route)
+        const bool ep_dev = g_ep_tab && T <= 8 && S <= 64 && g_overlap && !g_prof && dump.empty() && !g_trace &&
+                            g_pop.empty();
         // the MoE
         {
             k::ResStates st{};
@@ -3499,33 +3624,38 @@ void forward(Model& M, const int* tok, int T, int pos0, bool all_logits, OutMode
                 k::attn_res_rms_f16(st, nb + 1, Ly.ffn_res_score, 1, T, C, 1e-6f, c.eps, outs, g_s);
             }
         }
+        if (ep_dev) {   // GPU 1's copy of the layer's input: it crosses the host while this GPU routes
+            CU(cudaMemcpyAsync(g_ep_x_pin, W.xq, TC * 4, cudaMemcpyDeviceToHost, g_s));
+            CU(cudaEventRecord(g_ep_xq, g_s));
+        }
         g_pf.lap(g_pf.attn);
         gemm16(Ly.router16, c.E, C, W.x16, T, W.rlog, c.E);
-        const int S = T * c.K;
         int* rtop = W.route_d;
         float* rw = (float*) (W.route_d + S);
         k::route(W.rlog, Ly.probs_b, T, c.E, c.K, c.route_scale, rtop, rw, g_s);
-        CU(cudaMemcpyAsync(W.route_h, W.route_d, (size_t) S * 8, cudaMemcpyDeviceToHost, g_s));
+        const int* top = W.route_h;
+        const float* w = (const float*) (W.route_h + S);
         // (Q8_0 experts too with IK2_CPU_Q8=1: the last layers of unsloth's UD-Q4_K_XL)
         const bool lane_q8 = g_cpu_q8 && Ly.ty[0] == k::kQ8_0 && Ly.ty[1] == k::kQ8_0 && Ly.ty[2] == k::kQ8_0;
         const bool cpu_lane = g_pool && g_overlap && !g_prof && T <= 8 &&
                               (lane_q8 || (Ly.ty[0] == k::kNVFP4 && Ly.ty[1] == k::kNVFP4 && Ly.ty[2] == k::kNVFP4));
         double& t_cpu = g_t_cpu_f[lane_q8 ? 1 : 0];
         const double t_up = lane_q8 ? g_t_up * (34.0 / 32.0) / (36.0 / 64.0) : g_t_up;   // (the blocks' bytes a value)
-        if (cpu_lane) CU(cudaMemcpyAsync(W.x_h, W.xq, TC * 4, cudaMemcpyDeviceToHost, g_s));
-        CU(cudaStreamSynchronize(g_s));
-        const int* top = W.route_h;
-        const float* w = (const float*) (W.route_h + S);
-        pop_count(l, top, S);
-        g_pf.lap(g_pf.route);
-        if (!dump.empty()) {   // the experts picked, [T][K] int32 (compare with the reference's blk.L.picks)
-            FILE* f = std::fopen((dump + "/blk." + std::to_string(vis) + ".picks.i32").c_str(), "wb");
-            if (f) std::fwrite(top, 4, (size_t) S, f), std::fclose(f);
-        }
-        if (g_trace) {
-            const int hdr[3] = {l, T, c.K};
-            std::fwrite(hdr, 4, 3, g_trace);
-            std::fwrite(top, 4, S, g_trace);
+        if (!ep_dev) {
+            CU(cudaMemcpyAsync(W.route_h, W.route_d, (size_t) S * 8, cudaMemcpyDeviceToHost, g_s));
+            if (cpu_lane) CU(cudaMemcpyAsync(W.x_h, W.xq, TC * 4, cudaMemcpyDeviceToHost, g_s));
+            CU(cudaStreamSynchronize(g_s));
+            pop_count(l, top, S);
+            g_pf.lap(g_pf.route);
+            if (!dump.empty()) {   // the experts picked, [T][K] int32 (compare with the reference's blk.L.picks)
+                FILE* f = std::fopen((dump + "/blk." + std::to_string(vis) + ".picks.i32").c_str(), "wb");
+                if (f) std::fwrite(top, 4, (size_t) S, f), std::fclose(f);
+            }
+            if (g_trace) {
+                const int hdr[3] = {l, T, c.K};
+                std::fwrite(hdr, 4, 3, g_trace);
+                std::fwrite(top, 4, S, g_trace);
+            }
         }
         if (g_tp && T == 1 && g_overlap && !g_prof) {   // tensor-parallel experts, one token
             const double te0 = now();
@@ -3633,23 +3763,87 @@ void forward(Model& M, const int* tok, int T, int pos0, bool all_logits, OutMode
             dump_f("blk." + std::to_string(vis) + ".out", W.h, TC);
             continue;
         }
-        if (g_ep && T == 1 && g_overlap && !g_prof) {
+        // Expert parallel, every one of a layer's owned experts resident (g_ep_tab): each GPU takes the picks it owns
+        // out of the window on the device, groups them there and runs the experts there, and GPU 0 combines both GPUs'
+        // rows - the host never sees the picks, so a layer's experts start as soon as its route is done.  (No graphs
+        // here: their launch shapes were the pick counts, which are the device's now; a group past the last returns at
+        // once.)
+        if (ep_dev) {
             const double te0 = now();
-            const int F = c.F;
-            int row_of[16], n_d[2] = {0, 0};
-            const uint8_t* blob_d[2][16];
-            float sg_d[2][16], su_d[2][16];
-            int dev_of[16];
-            for (int i = 0; i < S; ++i) dev_of[i] = ep_owner(l, top[i]);
-            // GPU 1 first (it has the farther to go): x over, its picks (hits first, then the copied ones), y back
+            const bool exp_blk = k::experts_mma_fits(Ly.ty[0], Ly.ty[1], Ly.ty[2], C, c.F);
+            // the picks to GPU 1 over pinned host memory; its copy of the layer's input went at the norm (g_ep_xq),
+            // so it crosses the host while this GPU's router runs
+            CU(cudaMemcpyAsync(W.route_h, W.route_d, (size_t) S * 8, cudaMemcpyDeviceToHost, g_dev[0].s));
             CU(cudaEventRecord(g_ep_x, g_dev[0].s));
             for (int d = 1; d >= 0; --d) {
                 use_dev(d);
+                EpDev& E = g_ep_dev[d];
                 Work& Wd = dev_work(d);
+                const int* topd = Wd.route_d;
+                const float* wd = (const float*) (Wd.route_d + S);
+                if (d == 1) {
+                    CU(cudaStreamWaitEvent(g_dev[1].s, g_ep_xq, 0));
+                    CU(cudaMemcpyAsync(Wd.xq, g_ep_x_pin, (size_t) T * C * 4, cudaMemcpyHostToDevice, g_dev[1].s));
+                    CU(cudaStreamWaitEvent(g_dev[1].s, g_ep_x, 0));
+                    CU(cudaMemcpyAsync(Wd.route_d, W.route_h, (size_t) S * 8, cudaMemcpyHostToDevice, g_dev[1].s));
+                }
+                k::ep_compact(topd, wd, Ly.ep_own[d], S, d, E.top, E.w, E.n, g_dev[d].s);
+                k::group_route(E.top, E.w, S, c.K, Ly.tab_ep[d], Ly.sc_ep[d][0], Ly.sc_ep[d][1], Ly.sc_ep[d][2], E.blob,
+                               E.gn, E.tok, E.row, E.sg, E.su, E.wt, E.inv, g_dev[d].s);
+                // (the combine's table is the route's alone: built beside the experts, not after GPU 1's rows)
+                if (d == 0) k::ep_slots(rtop, rw, Ly.ep_own[0], Ly.sc_ep[0][2], S, E.id, E.wtc, g_dev[0].s);
+                float* y = d == 0 ? g_ep_y : Wd.y32;   // (GPU 0's rows at the front of the combine's y)
+                if (exp_blk) {   // NVFP4 on the tensor cores, an expert's rows once for its members
+                    uint16_t* limbs = (uint16_t*) Wd.gu32;
+                    k::f16_limbs_rows(Wd.xq, T, C, limbs, g_dev[d].s);
+                    k::experts_block_gu(E.blob, E.gn, E.tok, E.row, S, T, Ly.eb[0], C, c.F, limbs, E.sg, E.su,
+                                        c.gate_cap, c.up_cap, Wd.h16, g_dev[d].s);
+                    k::experts_block_down(E.blob, E.gn, E.row, S, Ly.eb[0] + Ly.eb[1], C, c.F, Wd.h16, y, g_dev[d].s);
+                } else {   // (the Q8_0 layers: the block kernels' planar form is not decoded here)
+                    k::experts_gate_up_swiglu_g(E.blob, E.gn, E.tok, E.row, S, Ly.ty[0], Ly.ty[1], Ly.eb[0], Wd.xq, C,
+                                                c.F, E.sg, E.su, c.gate_cap, c.up_cap, Wd.h16, g_dev[d].s);
+                    k::experts_down_g(E.blob, E.gn, E.row, S, Ly.ty[2], Ly.eb[0] + Ly.eb[1], Wd.h16, C, c.F, y,
+                                      g_dev[d].s);
+                }
+                if (d == 1) {
+                    CU(cudaMemcpyAsync(g_ep_y_pin, Wd.y32, (size_t) S * C * 4, cudaMemcpyDeviceToHost, g_dev[1].s));
+                    CU(cudaEventRecord(g_ep_done, g_dev[1].s));
+                }
+            }
+            use_dev(0);
+            Work& W0 = dev_work(0);
+            // GPU 1's rows into the back of y, the combine over both, the convs
+            CU(cudaStreamWaitEvent(g_dev[0].s, g_ep_done, 0));
+            CU(cudaMemcpyAsync(g_ep_y + (size_t) S * C, g_ep_y_pin, (size_t) S * C * 4, cudaMemcpyHostToDevice,
+                               g_dev[0].s));
+            k::moe_combine_f32(g_ep_y, g_ep_dev[0].id, g_ep_dev[0].wtc, T, c.K, C, W0.tmp, false, g_dev[0].s);
+            conv_rec(Ly, 3, W0.tmp, Ly.h_mlp, T, C);
+            k::conv4_res(W0.tmp, Ly.h_mlp, Ly.sc_mlp, nullptr, 0, T, C, W0.r, W0.h, g_dev[0].s);
+            t_exp += now() - te0;
+            dump_f("blk." + std::to_string(vis) + ".out", W.h, TC);
+            continue;
+        }
+        // Expert parallel (IK2_EP), a token or a short verify window: the picks of both GPUs side by side, the h and
+        // the rows they exchange over the host (no peer access on the target box), a layer's three launches as graphs.
+        if (g_ep && T <= 8 && S <= 64 && g_overlap && !g_prof) {
+            const double te0 = now();
+            const int F = c.F;
+            int row_of[64], n_d[2] = {0, 0};
+            const uint8_t* blob_d[2][64];
+            float sg_d[2][64], su_d[2][64];
+            int tok_d[2][64], dev_of[64];
+            for (int i = 0; i < S; ++i) dev_of[i] = ep_owner(l, top[i]);
+            // the h to GPU 1, queued first: it crosses the host while the host looks the picks up
+            CU(cudaMemcpyAsync(g_ep_x_pin, dev_work(0).xq, (size_t) T * C * 4, cudaMemcpyDeviceToHost, g_dev[0].s));
+            CU(cudaEventRecord(g_ep_x, g_dev[0].s));
+            // (1) each GPU's picks in its cache and in its packed table: hits first (their blocks are there), the
+            // copies after.  One table a GPU, at a fixed address: a graph's kernels read it every token.
+            for (int d = 1; d >= 0; --d) {
+                use_dev(d);
                 ExpertCache& Ed = dev_cache(d);
                 const uint64_t tick = ++Ed.tick;
-                int hit[16], mis[16], nhit = 0, nmis = 0;
-                const uint8_t* where[16];
+                int hit[64], mis[64], nhit = 0, nmis = 0;
+                const uint8_t* where[64];
                 for (int i = 0; i < S; ++i) {
                     if (dev_of[i] != d) continue;
                     bool missed = false;
@@ -3662,64 +3856,111 @@ void forward(Model& M, const int* tok, int T, int pos0, bool all_logits, OutMode
                     for (int j = 0; j < (pass ? nmis : nhit); ++j) {
                         const int i = pass ? mis[j] : hit[j], e = top[i];
                         blob_d[d][n] = where[i];
+                        tok_d[d][n] = i / c.K;
                         sg_d[d][n] = Ly.scale[0].empty() ? 1.0f : Ly.scale[0][e];
                         su_d[d][n] = Ly.scale[1].empty() ? 1.0f : Ly.scale[1][e];
                         row_of[i] = n++;
                     }
                 n_d[d] = n;
-                if (d == 1) CU(cudaStreamWaitEvent(g_s, g_ep_x, 0));
-                if (!n) continue;
-                const int ps = Wd.pack_slot;
-                Wd.pack_slot = (Wd.pack_slot + 1) % Work::kPackRing;
-                uint8_t* pk = Wd.pack_h[ps];
-                uint8_t* pk_d = Wd.pack_d[ps];
-                const int zeros[16] = {};
-                std::memcpy(pk, blob_d[d], n * sizeof(void*));
-                std::memcpy(pk + 512, zeros, n * 4);
-                std::memcpy(pk + 1024, sg_d[d], n * 4);
-                std::memcpy(pk + 1280, su_d[d], n * 4);
-                CU(cudaMemcpyAsync(pk_d, pk, 1536, cudaMemcpyHostToDevice, g_s));
-                const auto* pb = (const uint8_t* const*) pk_d;
-                const int* ptk = (const int*) (pk_d + 512);
-                const float* psg = (const float*) (pk_d + 1024);
-                const float* psu = (const float*) (pk_d + 1280);
-                if (d == 1) CU(cudaMemcpyPeerAsync(Wd.xq, 1, dev_work(0).xq, 0, (size_t) C * 4, g_s));
-                for (int part = 0; part < 2; ++part) {
-                    const int p0 = part ? nhit : 0, m = part ? nmis : nhit;
-                    if (part) CU(cudaStreamWaitEvent(g_s, g_ep_cp[d], 0));
-                    if (!m) continue;
-                    k::experts_gate_up_swiglu(pb + p0, ptk + p0, m, Ly.ty[0], Ly.ty[1], Ly.eb[0], Wd.xq, C, F, psg + p0,
-                                              psu + p0, c.gate_cap, c.up_cap, Wd.h16 + (size_t) p0 * F, g_s);
-                    k::experts_down(pb + p0, m, Ly.ty[2], Ly.eb[0] + Ly.eb[1], Wd.h16 + (size_t) p0 * F, C, F,
-                                    Wd.y32 + (size_t) p0 * C, g_s);
+                uint8_t* pk = g_ep_pk_h[d];
+                if (n) {
+                    std::memcpy(pk, blob_d[d], n * sizeof(void*));
+                    std::memcpy(pk + 512, tok_d[d], n * 4);
+                    std::memcpy(pk + 1024, sg_d[d], n * 4);
+                    std::memcpy(pk + 1280, su_d[d], n * 4);
                 }
-                if (d == 1) {
-                    CU(cudaMemcpyPeerAsync(dev_work(0).y32 + (size_t) 8 * C, 0, Wd.y32, 1, (size_t) n * C * 4, g_s));
-                    CU(cudaEventRecord(g_ep_done, g_s));
+                if (d == 0) {   // the combine's: which row of y a pick's output is at, and its weight
+                    int id[64];
+                    float wt[64];
+                    for (int i = 0; i < S; ++i) {
+                        id[i] = (dev_of[i] ? S : 0) + row_of[i];
+                        wt[i] = w[i] * (Ly.scale[2].empty() ? 1.0f : Ly.scale[2][top[i]]);
+                    }
+                    std::memcpy(pk + 768, id, S * 4);
+                    std::memcpy(pk + 1536, wt, S * 4);
                 }
+                if (n || d == 0) CU(cudaMemcpyAsync(g_ep_pk_d[d], pk, 2048, cudaMemcpyHostToDevice, g_dev[d].s));
             }
-            // on GPU 0 (current): the combine over both GPUs' rows (GPU 1's from row 8)
-            if (n_d[1]) CU(cudaStreamWaitEvent(g_s, g_ep_done, 0));
-            {
-                const int ps = W.pack_slot;
-                W.pack_slot = (W.pack_slot + 1) % Work::kPackRing;
-                uint8_t* pk = W.pack_h[ps];
-                uint8_t* pk_d = W.pack_d[ps];
-                int id[16];
-                float wt[16];
-                for (int i = 0; i < S; ++i) {
-                    id[i] = (dev_of[i] ? 8 : 0) + row_of[i];
-                    wt[i] = w[i] * (Ly.scale[2].empty() ? 1.0f : Ly.scale[2][top[i]]);
+            // (2) the three graphs of this visit's T and pick counts, or a variant of them recaptured
+            EpGraphs& GE = g_ep_graphs[((size_t) slot * c.n_visit + vis) * EpGraphs::kT + T];
+            int gv = -1;
+            for (int i = 0; i < GE.used; ++i)
+                if (GE.n0[i] == n_d[0] && GE.n1[i] == n_d[1]) {
+                    gv = i;
+                    break;
                 }
-                std::memcpy(pk + 768, id, S * 4);
-                std::memcpy(pk + 1536, wt, S * 4);
-                CU(cudaMemcpyAsync(pk_d + 768, pk + 768, 1024, cudaMemcpyHostToDevice, g_s));
-                k::moe_combine_f32(W.y32, (const int*) (pk_d + 768), (const float*) (pk_d + 1536), T, c.K, C, W.tmp,
-                                   false, g_s);
+            if (gv < 0) {
+                const bool free_slot = GE.used < EpGraphs::kVar;
+                gv = free_slot ? GE.used++ : GE.next;
+                if (!free_slot) GE.next = (GE.next + 1) % EpGraphs::kVar;
+                FastGraph* old[3] = {&GE.g1[gv], &GE.g0x[gv], &GE.g0c[gv]};
+                if (old[0]->exec || old[1]->exec || old[2]->exec) {
+                    CU(cudaStreamSynchronize(g_dev[0].s));   // (its last launch is queued, not run)
+                    CU(cudaStreamSynchronize(g_dev[1].s));
+                    for (FastGraph* g : old) {
+                        if (g->exec) CU(cudaGraphExecDestroy(g->exec));
+                        if (g->graph) CU(cudaGraphDestroy(g->graph));
+                        *g = {};
+                    }
+                }
+                GE.n0[gv] = n_d[0], GE.n1[gv] = n_d[1];
             }
+            Work& W0 = dev_work(0);
+            auto expert_rows = [&](int d, int n, float* y) {   // one GPU's picks: its packed table's rows 0 .. n-1
+                Work& Wd = dev_work(d);
+                const auto* pb = (const uint8_t* const*) g_ep_pk_d[d];
+                const int* ptk = (const int*) (g_ep_pk_d[d] + 512);
+                const float* psg = (const float*) (g_ep_pk_d[d] + 1024);
+                const float* psu = (const float*) (g_ep_pk_d[d] + 1280);
+                k::experts_gate_up_swiglu(pb, ptk, n, Ly.ty[0], Ly.ty[1], Ly.eb[0], Wd.xq, C, F, psg, psu, c.gate_cap,
+                                          c.up_cap, Wd.h16, g_dev[d].s);
+                k::experts_down(pb, n, Ly.ty[2], Ly.eb[0] + Ly.eb[1], Wd.h16, C, F, y, g_dev[d].s);
+            };
+            auto ep_g1 = [&]() {   // GPU 1: the h over the host, its picks, its rows back the same way
+                CU(cudaMemcpyAsync(dev_work(1).xq, g_ep_x_pin, (size_t) T * C * 4, cudaMemcpyHostToDevice, g_dev[1].s));
+                expert_rows(1, n_d[1], dev_work(1).y32);
+                CU(cudaMemcpyAsync(g_ep_y_pin, dev_work(1).y32, (size_t) S * C * 4, cudaMemcpyDeviceToHost,
+                                   g_dev[1].s));
+            };
+            auto ep_g0x = [&]() {   // GPU 0's picks, its rows at the front of y
+                expert_rows(0, n_d[0], g_ep_y);
+            };
+            auto ep_g0c = [&]() {   // GPU 0: GPU 1's rows in, the combine over both, the convs
+                CU(cudaMemcpyAsync(g_ep_y + (size_t) S * C, g_ep_y_pin, (size_t) S * C * 4, cudaMemcpyHostToDevice,
+                                   g_dev[0].s));
+                k::moe_combine_f32(g_ep_y, (const int*) (g_ep_pk_d[0] + 768), (const float*) (g_ep_pk_d[0] + 1536), T,
+                                   c.K, C, W0.tmp, false, g_dev[0].s);
+                conv_rec(Ly, 3, W0.tmp, Ly.h_mlp, T, C);
+                k::conv4_res(W0.tmp, Ly.h_mlp, Ly.sc_mlp, nullptr, 0, T, C, W0.r, W0.h, g_dev[0].s);
+            };
+            const bool ep_graph = g_graph && !g_rec;
+            auto replay = [&](FastGraph& G, int d, auto&& body) {   // the first of a kind records it, the rest replay it
+                if (!ep_graph) {
+                    body();
+                    return;
+                }
+                if (!G.exec) {
+                    CU(cudaStreamBeginCapture(g_dev[d].s, cudaStreamCaptureModeGlobal));
+                    body();
+                    CU(cudaStreamEndCapture(g_dev[d].s, &G.graph));
+                    CU(cudaGraphInstantiate(&G.exec, G.graph, 0));
+                }
+                CU(cudaGraphLaunch(G.exec, g_dev[d].s));
+            };
+            // (3) both GPUs' picks side by side, then GPU 0's combine once GPU 1's rows are in
+            if (n_d[1]) {
+                use_dev(1);
+                CU(cudaStreamWaitEvent(g_dev[1].s, g_ep_x, 0));
+                CU(cudaStreamWaitEvent(g_dev[1].s, g_ep_cp[1], 0));
+                replay(GE.g1[gv], 1, ep_g1);
+                CU(cudaEventRecord(g_ep_done, g_dev[1].s));
+                use_dev(0);
+            }
+            CU(cudaStreamWaitEvent(g_dev[0].s, g_ep_cp[0], 0));
+            if (n_d[0]) replay(GE.g0x[gv], 0, ep_g0x);
+            if (n_d[1]) CU(cudaStreamWaitEvent(g_dev[0].s, g_ep_done, 0));
+            replay(GE.g0c[gv], 0, ep_g0c);
             t_exp += now() - te0;
-            conv_rec(Ly, 3, W.tmp, Ly.h_mlp, T, C);
-            k::conv4_res(W.tmp, Ly.h_mlp, Ly.sc_mlp, nullptr, 0, T, C, W.r, W.h, g_s);
             dump_f("blk." + std::to_string(vis) + ".out", W.h, TC);
             continue;
         }
@@ -4563,9 +4804,11 @@ int main(int argc, char** argv) {
     Shards S(model);
     Model M;
     Config& c = M.c;
-    const std::string a = "inkling2.";
+    std::string a = "inkling2.";
+    if (S.get("inkling2_loop.block_count")) a = "inkling2_loop.";
+    else if (!S.get("inkling2.block_count")) die("no key inkling2.block_count");
     // a key under PR #32187's name, else under llama.cpp master's; a value master writes a visit (an array of equal
-    // values) read as one
+    // values) read as one. inkling2_loop.* is master's looped-Mini layout (loop.count / loop.start / loop.end).
     auto key = [&](const char* k1, const char* k2 = nullptr) -> double {
         const auto* v = S.get(a + k1);
         if (!v && k2) v = S.get(a + k2);
@@ -4596,19 +4839,33 @@ int main(int argc, char** argv) {
     c.up_cap = (float) key("mlp_up_softcap", "activation.situ_linear_beta");
     c.logit_cap = (float) key("final_logit_softcapping");
     // the loop (Inkling-2-Mini): block_count counts the layer visits, the core's layers once a pass
-    if (S.get(a + "num_loops")) c.n_pass = (int) key("num_loops");
+    if (S.get(a + "num_loops") || S.get(a + "loop.count"))
+        c.n_pass = (int) key("num_loops", "loop.count");
     if (c.n_pass > 1) {
-        c.core0 = (int) key("loop.core_start"), c.core1 = (int) key("loop.core_end"), c.rank = (int) key("loop.gate_rank");
+        c.core0 = (int) key("loop.core_start", "loop.start");
+        c.core1 = (int) key("loop.core_end", "loop.end");
+        c.rank = (int) key("loop.gate_rank");
         if (c.core0 <= 0 || c.core1 <= c.core0 || c.core0 % c.block || (c.core1 - c.core0) % c.block || c.rank <= 0)
             die("the looped core must start after the first block and span whole blocks");
     }
     const int n_core = c.core1 - c.core0;
-    c.n_layer = c.n_visit - (c.n_pass - 1) * n_core;
+    // inkling2.* : block_count is visits. inkling2_loop.* : block_count is physical layers.
+    if (a == "inkling2_loop.") {
+        c.n_layer = (int) key("block_count");
+        c.n_visit = c.n_layer + (c.n_pass - 1) * n_core;
+    } else {
+        c.n_visit = (int) key("block_count");
+        c.n_layer = c.n_visit - (c.n_pass - 1) * n_core;
+    }
     {   // the pattern is a visit's; a layer's is its first visit's (the same in every pass)
         const auto* sp = S.get(a + "attention.sliding_window_pattern");
-        if (!sp || (int) sp->items.size() != c.n_visit) die("sliding_window_pattern");
-        for (int l = 0; l < c.n_layer; ++l)
-            c.sliding.push_back(sp->items[l < c.core1 ? l : l + (c.n_pass - 1) * n_core].u != 0);
+        if (!sp) die("sliding_window_pattern");
+        const int np = (int) sp->items.size();
+        if (np != c.n_visit && np != c.n_layer) die("sliding_window_pattern");
+        for (int l = 0; l < c.n_layer; ++l) {
+            const int i = (np == c.n_layer) ? l : (l < c.core1 ? l : l + (c.n_pass - 1) * n_core);
+            c.sliding.push_back(sp->items[i].u != 0);
+        }
     }
     // (a row of an expert is whole blocks of its type: checked per tensor below; 64 covers NVFP4 and Q8_0)
     if (c.D != 128 || c.H % c.KV || c.C % 64 || c.F % 64) die("unexpected shapes");
@@ -4674,6 +4931,14 @@ int main(int argc, char** argv) {
     }
     g_ep = n_gpu == 2 && getenv("IK2_EP") && std::atoi(getenv("IK2_EP"));
     g_tp = n_gpu == 2 && !g_ep && getenv("IK2_TP") && std::atoi(getenv("IK2_TP"));
+    // dual decode/verify: attn_multi is ALU-bound at depth. Default to flash (IK2_GROUP=1) unless the operator set IK2_GROUP.
+    // MMA in run_layer_attn is the long-ctx path; this keeps the measured 81 tok/s fallback if MMA does not fire.
+    if (dual() && !getenv("IK2_GROUP")) g_group_attn = false;
+    // FP16 KV at 262k is ~8.5 GiB and starves GPU 0's expert cache (measured: 4.6 GiB free, 23 tok/s host-path).
+    if (dual() && !getenv("IK2_KV")) {
+        g_kv_fp8 = true;
+        std::printf("dual: IK2_KV=fp8 (FP16 KV does not leave expert room at 262k on 16 GB)\n");
+    }
     if (dual()) {
         int p01 = 0, p10 = 0;
         CU(cudaDeviceCanAccessPeer(&p01, 0, 1));
@@ -4686,6 +4951,7 @@ int main(int argc, char** argv) {
         }
         CU(cudaSetDevice(0));
         CU(cudaEventCreateWithFlags(&g_ep_x, cudaEventDisableTiming));
+        CU(cudaEventCreateWithFlags(&g_ep_xq, cudaEventDisableTiming));
         CU(cudaEventCreateWithFlags(&g_ep_cp[0], cudaEventDisableTiming));
         CU(cudaSetDevice(1));
         CU(cudaEventCreateWithFlags(&g_ep_cp[1], cudaEventDisableTiming));
@@ -4694,6 +4960,30 @@ int main(int argc, char** argv) {
         CU(cudaEventCreateWithFlags(&g_tp_h[0], cudaEventDisableTiming));
         CU(cudaSetDevice(1));
         CU(cudaEventCreateWithFlags(&g_tp_h[1], cudaEventDisableTiming));
+        // (expert parallel: what the two GPUs exchange a layer - the h, GPU 1's rows - in pinned host memory, and a
+        //  packed table a GPU with a fixed address, so its graphs' kernels read it every token)
+        CU(cudaHostAlloc(&g_ep_x_pin, (size_t) 8 * c.C * 4, cudaHostAllocPortable));
+        CU(cudaHostAlloc(&g_ep_y_pin, (size_t) 64 * c.C * 4, cudaHostAllocPortable));
+        for (int d = 0; d < 2; ++d) {
+            CU(cudaHostAlloc(&g_ep_pk_h[d], 2048, cudaHostAllocPortable));
+            CU(cudaSetDevice(d));
+            g_ep_pk_d[d] = dalloc<uint8_t>(2048);
+        }
+        CU(cudaSetDevice(0));
+        g_ep_y = dalloc<float>((size_t) 2 * 64 * c.C);
+        // (a layer whose owned experts are all resident routes and runs its experts on the devices: a GPU's window
+        //  of picks, its groups, and on GPU 0 the combine's table - 64 slots each, kGroupMax members a group)
+        for (int d = 0; d < 2; ++d) {
+            CU(cudaSetDevice(d));
+            EpDev& E = g_ep_dev[d];
+            E.top = dalloc<int>(64), E.w = dalloc<float>(64), E.n = dalloc<int>(1);
+            E.blob = dalloc<const uint8_t*>(64), E.gn = dalloc<int>(64);
+            E.tok = dalloc<int>((size_t) 64 * k::kGroupMax), E.row = dalloc<int>((size_t) 64 * k::kGroupMax);
+            E.sg = dalloc<float>(64), E.su = dalloc<float>(64), E.wt = dalloc<float>(64), E.inv = dalloc<int>(64);
+            if (d == 0) E.id = dalloc<int>(64), E.wtc = dalloc<float>(64);
+        }
+        CU(cudaSetDevice(0));
+        g_ep_graphs.resize((size_t) std::max(g_parallel, 1) * c.n_visit * EpGraphs::kT);
         std::printf("%s over 2 GPUs (peer access %s)\n", g_tp ? "experts tensor-parallel" : "expert parallel",
                     p01 && p10 ? "on" : "off: copies through the host");
     }
@@ -4715,7 +5005,7 @@ int main(int argc, char** argv) {
         CU(cudaDeviceGetStreamPriorityRange(&lo, &hi));
         CU(cudaStreamCreateWithPriority(&g_ls, cudaStreamNonBlocking, lo));
     }
-    if (n_gpu > 1 && getenv("IK2_DENSE")) die("IK2_DENSE with --gpus > 1");
+    if (n_gpu > 1 && getenv("IK2_DENSE") && !dual()) die("IK2_DENSE with --gpus > 1");
 
     // Do the experts all fit in VRAM beside the dense weights and the K / V cache (Inkling-2-Mini's 14.7 GiB on a 24 GB
     // card)?  Then they all stay there: the dense weights are kept as the GGUF's blocks unless IK2_DENSE says otherwise
@@ -4725,6 +5015,9 @@ int main(int argc, char** argv) {
     g_block = !(getenv("IK2_BLOCK") && !std::atoi(getenv("IK2_BLOCK")));
     g_attn_mma = c.D == 128 && c.H / c.KV <= 8 ? (getenv("IK2_ATTN_MMA") ? std::atoi(getenv("IK2_ATTN_MMA")) : 1) : 0;
     g_mma_split = k::attn_decode_mma_blocks(c.KV);
+    if (dual())
+        std::printf("dual attention: MMA=%d group_attn=%d (0: T<=8 uses flash, not attn_multi)\n", g_attn_mma,
+                    (int) g_group_attn);
     if (g_parallel > 1 && n_gpu > 1) die("--parallel > 1 requires --gpus 1");
     if (n_gpu == 1 && getenv("IK2_KV_MANAGED") && atoi(getenv("IK2_KV_MANAGED"))) {
         if (g_parallel > 1) die("--parallel > 1 is not supported with IK2_KV_MANAGED");
@@ -4813,6 +5106,8 @@ int main(int argc, char** argv) {
             g_fit_hint = m;
         }
     }
+    // dual EP/TP: dense is GPU 0 only, so Q8 blocks are legal. g_fast_want stays false (graphs stay one-GPU).
+    if (dual() && !getenv("IK2_DENSE")) g_dense_q8 = true;
 
     // the dense weights
     const double t_dense = now();
@@ -4865,8 +5160,44 @@ int main(int argc, char** argv) {
     std::vector<float> lp_q, lp_kv;   // a looped core's message queries, [2 n_core][C] each
     std::vector<float> lp_all;
     if (c.n_pass > 1) {
-        lp_q = host_f32(S, "loop_res_query.weight", (size_t) 2 * n_core * C);
-        lp_kv = host_f32(S, "loop_kv_res_query.weight", (size_t) 2 * n_core * C);
+        if (S.info("loop_res_query.weight")) {
+            lp_q = host_f32(S, "loop_res_query.weight", (size_t) 2 * n_core * C);
+            lp_kv = host_f32(S, "loop_kv_res_query.weight", (size_t) 2 * n_core * C);
+        } else {
+            // llama.cpp master: per-layer attn/ffn res queries, optional loop_msg_query [C,4]
+            lp_q.assign(2 * (size_t) n_core * C, 0.f);
+            lp_kv.assign(2 * (size_t) n_core * C, 0.f);
+            bool warned = false;
+            auto rowC = [&](const std::string& n) {
+                const auto* t = S.info(n);
+                if (!t) die("no tensor " + n);
+                auto v = host_f32(S, n, t->elements());
+                if (v.size() < C) die(n + " too short for a residual query");
+                v.resize(C);
+                return v;
+            };
+            for (int i = 0; i < n_core; ++i) {
+                const std::string b = "blk." + std::to_string(c.core0 + i) + ".";
+                const auto q = rowC(b + "attn_res_query.weight");
+                const auto m = rowC(b + "ffn_res_query.weight");
+                std::memcpy(lp_q.data() + (2 * (size_t) i) * C, q.data(), C * 4);
+                std::memcpy(lp_q.data() + (2 * (size_t) i + 1) * C, m.data(), C * 4);
+                if (S.info(b + "loop_msg_query.weight")) {
+                    const auto mq = host_f32(S, b + "loop_msg_query.weight", 4 * C);
+                    std::memcpy(lp_q.data() + (2 * (size_t) i) * C, mq.data(), C * 4);
+                    std::memcpy(lp_kv.data() + (2 * (size_t) i) * C, mq.data() + C, C * 4);
+                    std::memcpy(lp_kv.data() + (2 * (size_t) i + 1) * C, mq.data() + 2 * C, C * 4);
+                    std::memcpy(lp_q.data() + (2 * (size_t) i + 1) * C, mq.data() + 3 * C, C * 4);
+                } else {
+                    std::memcpy(lp_kv.data() + (2 * (size_t) i) * C, q.data(), C * 4);
+                    std::memcpy(lp_kv.data() + (2 * (size_t) i + 1) * C, q.data(), C * 4);
+                    if (!warned) {
+                        std::printf("loop: no loop_msg_query / loop_res_query; k/v queries copied from attn_res_query\n");
+                        warned = true;
+                    }
+                }
+            }
+        }
     }
     for (int l = 0; l < c.n_layer; ++l) {
         Layer& Ly = M.L[l];
@@ -4990,7 +5321,9 @@ int main(int argc, char** argv) {
             exp_jobs.push_back({l, n, pr.second});
         }
         if (c.n_pass > 1 && l >= c.core0 && l < c.core1) {   // the core: its later passes' message gates and queries
-            static const char* mod[4] = {"attn", "k", "v", "mlp"};
+            static const char* mod_old[4] = {"attn", "k", "v", "mlp"};
+            static const char* mod_new[4] = {"q_ctrl", "k_ctrl", "v_ctrl", "ffn_ctrl"};
+            const char** mod = S.info(b + "loop_q_ctrl_down.weight") ? mod_new : mod_old;
             for (int m = 0; m < 4; ++m) {
                 const std::string p = b + "loop_" + mod[m] + "_";
                 const bool compact = g_fast_want && getenv("IK2_GATE_BF16") && atoi(getenv("IK2_GATE_BF16"));
@@ -5094,7 +5427,11 @@ int main(int argc, char** argv) {
     // (the resident path keeps every expert in VRAM, so no pinned host copy is needed: the experts go from where the
     //  files are mapped straight to their slots, and stay in the page cache for the next load - IK2_HOST=pinned: as
     //  for the other models)
-    const bool host_mmap = getenv("IK2_HOST") ? std::string(getenv("IK2_HOST")) == "mmap" : g_fast_want;
+    // dual-GPU Mini on a 16 GB host: do not pin 14.7 GiB and do not WILLNEED the GGUF into page cache.
+    // GgufFile is already MAP_PRIVATE; we alias it for the warm copy then DONTNEED. IK2_HOST=mmap|pinned to override.
+    const bool host_mmap = getenv("IK2_HOST")
+        ? std::string(getenv("IK2_HOST")) == "mmap"
+        : (g_fast_want || dual());
     if (host_mmap) {
         if (g_pool) die("IK2_HOST=mmap with the CPU lane");
         for (const auto& J : exp_jobs) {
@@ -5108,7 +5445,7 @@ int main(int argc, char** argv) {
                 WIN32_MEMORY_RANGE_ENTRY entry{(void*) a0, len};
                 PrefetchVirtualMemory(GetCurrentProcess(), 1, &entry, 0);
 #else
-                ::madvise((void*) a0, len, MADV_WILLNEED);
+                if (n_gpu == 1) ::madvise((void*) a0, len, MADV_WILLNEED);   // (n_gpu > 1: the page cache can't hold the whole set)
 #endif
             }
         }
@@ -5271,7 +5608,8 @@ int main(int argc, char** argv) {
     ik2::draft::Drafter* drafter = nullptr;
     uint16_t* draft_head = M.out_w.f16;
     if (!draft_path.empty()) {
-        if (n_gpu != 1) die("--draft: one GPU only so far");
+        if (n_gpu > 2) die("--draft: at most two GPUs");
+        if (n_gpu == 2) use_dev(0);
         if (!draft_head && M.out_w.q8) {   // (a Q8_0 head: an FP16 copy for the drafter's base logits and its fold)
             const size_t n = (size_t) c.n_rows * c.C;
             draft_head = dalloc<uint16_t>(n);
@@ -5460,8 +5798,8 @@ int main(int argc, char** argv) {
     //  stays in VRAM - nothing more is allocated but a token's graph)
     // (IK2_ROOM_MIB overrides the streaming reserve: an 8 GB card has no 2 GiB to spare beside the cache)
     const size_t room = getenv("IK2_ROOM_MIB") ? (size_t) std::max(0, atoi(getenv("IK2_ROOM_MIB"))) << 20
-                        : g_fast_want         ? (size_t) 256 << 20
-                                              : (size_t) 2 << 30;
+                        : (g_fast_want || dual()) ? (size_t) 256 << 20
+                                                  : (size_t) 2 << 30;
     const size_t budget = std::min((size_t) (cache_gb * 1073741824.0), fr > room ? fr - room : (size_t) 0);
     EC.tp = g_tp ? d : -1;
     EC.init(M.L, dual() ? -1 : d, c.n_layer, c.E, budget);
@@ -5523,6 +5861,20 @@ int main(int argc, char** argv) {
             EC.misses = m0, EC.bytes_up = b0;
         }
     }
+    if (g_ep) {   // this GPU's owner table and the experts' scales on it, and its blobs' slots (build_ep_tab): a layer
+                  // routes and runs its experts here (forward's ep_dev)
+        for (int l = 0; l < c.n_layer; ++l) {
+            Layer& Ly = M.L[l];
+            std::vector<uint8_t> own(c.E);
+            for (int e = 0; e < c.E; ++e) own[e] = (uint8_t) ep_owner(l, e);
+            Ly.ep_own[d] = dalloc<uint8_t>(c.E);
+            CU(cudaMemcpy(Ly.ep_own[d], own.data(), c.E, cudaMemcpyHostToDevice));
+            for (int r = 0; r < 3; ++r)
+                if (!Ly.scale[r].empty()) Ly.sc_ep[d][r] = dev_f32(Ly.scale[r]);
+        }
+        build_ep_tab(M, d);
+    }
+    g_ep_tab_miss[d] = EC.misses;
     if (g_fast_want && d == 0) {   // the resident path: every expert in now, and where each is on the device
         auto blocks = [](const Mat& m) { return m.raw || m.q8; };   // (kept as the GGUF's blocks, whole or planar)
         bool all = !EC.pools.empty(), raw = blocks(M.out_w);
@@ -5581,6 +5933,25 @@ int main(int argc, char** argv) {
     }
     std::fflush(stdout);
     }
+    if (host_mmap && n_gpu > 1) {   // (both GPU caches are full: drop PTEs and the file cache)
+#ifndef _WIN32
+        std::vector<int> fds(S.paths.size(), -1);
+        for (size_t i = 0; i < S.paths.size(); ++i)
+            fds[i] = ::open(S.paths[i].c_str(), O_RDONLY);
+        for (const auto& J : exp_jobs) {
+            const uint8_t* p = S.data(J.name);
+            const size_t pg = 4096, a0 = (size_t) p & ~(pg - 1);
+            const size_t len = (size_t) p - a0 + tensor_bytes(*S.info(J.name));
+            ::madvise((void*) a0, len, MADV_DONTNEED);
+            const int fd = fds[S.file_of(J.name)];
+            if (fd >= 0)
+                ::posix_fadvise(fd, (off_t) S.file_offset(J.name),
+                                (off_t) tensor_bytes(*S.info(J.name)), POSIX_FADV_DONTNEED);
+        }
+        for (int fd : fds)
+            if (fd >= 0) ::close(fd);
+#endif
+    }
     if (g_managed_experts) {
         CU(cudaStreamSynchronize(g_s));
         size_t remaining = 0, total = 0;
@@ -5589,6 +5960,14 @@ int main(int argc, char** argv) {
         const size_t reserve =
             (size_t)(getenv("IK2_HEADROOM_MIB") ? std::max(0, atoi(getenv("IK2_HEADROOM_MIB"))) : 1536) << 20;
         g_kv_room = remaining > reserve ? remaining - reserve : 0;
+    }
+    if (g_ep) {   // the device route needs every layer's owned experts on both GPUs: a layer short of one keeps the
+                  // host path, whose Ed.get evicts slots the others' tables point at, so the two never mix
+        g_ep_tab = true;
+        for (const auto& Ly : M.L) g_ep_tab = g_ep_tab && Ly.tab_ep[0] && Ly.tab_ep[1];
+        std::printf("expert parallel: %s\n",
+                    g_ep_tab ? "every owned expert resident - a layer routes and runs its experts on the devices"
+                             : "a layer's owned experts are short of the caches - the host path");
     }
     // the caches' counters, summed over the GPUs
     auto ec_sum = [&](auto f) {
